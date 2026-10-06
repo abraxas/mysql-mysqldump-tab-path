@@ -16,6 +16,8 @@
 
 # mysql-mysqldump-tab-path
 
+**Class:** File write
+
 **MySQL Community Server** `mysqldump` `26.7.0` (`06a5c1c`) - Oracle
 
 `mysqldump --tab=DIR` writes one `.sql` per table using `fn_format` **without** `MY_REPLACE_DIR`. A hostile `SHOW TABLES` name with `/` or `..` keeps that directory. DIR is ignored. The dump UID `my_fopen`s the path.
@@ -25,6 +27,7 @@
 | | |
 |---|---|
 | ID | no CVE yet |
+| Class | **File write** (client `--tab` `.sql`) |
 | CWE | [CWE-22](https://cwe.mitre.org/data/definitions/22.html) |
 | CVSS | **High: 8.1** `CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:H/I:H/A:N` |
 | Product | [MySQL Community Server](https://github.com/mysql/mysql-server) `mysqldump` |
