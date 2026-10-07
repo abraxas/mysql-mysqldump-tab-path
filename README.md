@@ -16,8 +16,8 @@
 
 # mysql-mysqldump-tab-path
 
-**Class:** File write
-**Reach:** Remote
+**Class:** File write (client)
+**Reach:** Remote (UI:R)
 
 **MySQL Community Server** `mysqldump` `26.7.0` (`06a5c1c`) - Oracle
 

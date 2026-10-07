@@ -9,6 +9,11 @@ import socket
 import struct
 import threading
 import traceback
+from dataclasses import dataclass
+
+# mysqldump dump_all_tables_in_db uses hash_key[NAME_LEN]. Keep SHOW TABLES
+# names under 192 so this leftover is a client path write, not the G1 overflow.
+NAME_LEN = 192
 
 WITNESS = os.environ.get("WITNESS", "MYSQL-DUMP-TAB-TRAVERSAL-WITNESS")
 CONTROL_PORT = int(os.environ.get("CONTROL_PORT", "3306"))
@@ -40,12 +45,37 @@ COM_QUIT = 0x01
 COM_INIT_DB = 0x02
 COM_QUERY = 0x03
 COM_FIELD_LIST = 0x04
-COM_PING = 0x0E
 COM_STATISTICS = 0x09
+COM_PING = 0x0E
 COM_RESET_CONNECTION = 0x1F
 
+PROTOCOL_VERSION = 10
+PACKET_HEADER_LEN = 4
+OK_HEADER = 0x00
+EOF_HEADER = 0xFE
+ERR_HEADER = 0xFF
+NULL_CELL = 0xFB
+AUTH_SWITCH_HEADER = 0xFE
+LENENC_MARK_2B = 0xFC
+LENENC_MARK_3B = 0xFD
+LENENC_MARK_8B = 0xFE
+LENENC_1B_LIMIT = 251
+COLUMN_LENGTH_CODE = 0x0C
+COLUMN_MAX_OCTETS = 16 * 1024 * 1024
+AUTH_PLUGIN_DATA_LEN = 21
+RESERVED_FILLER_LEN = 10
+# HandshakeResponse41: capability(4) max_packet(4) charset(1) reserved(23)
+HANDSHAKE_RESPONSE_SKIP = 4 + 4 + 1 + 23
+SCRAMBLE_LEN = 20
+AUTH_PLUGIN = "mysql_native_password"
 MYSQL_TYPE_VAR_STRING = 0xFD
 CHARSET_UTF8MB4 = 45
+COLLATION_UTF8MB4 = "utf8mb4_0900_ai_ci"
+ERRNO_NO_SUCH_TABLE = 1146
+SQLSTATE_NO_SUCH_TABLE = "42S02"
+CLIENT_TIMEOUT_S = 30.0
+LISTEN_BACKLOG = 16
+COMMAND_SEQ = 1
 
 SERVER_CAPS = (
     CLIENT_LONG_PASSWORD
@@ -63,9 +93,14 @@ SERVER_CAPS = (
     | CLIENT_DEPRECATE_EOF
 )
 
-SCRAMBLE = b"a" * 20
-_thread_ids = 0
-_tid_lock = threading.Lock()
+SCRAMBLE = b"a" * SCRAMBLE_LEN
+SHOW_TABLES_COLS = ["Tables_in_testdb"]
+SHOW_CREATE_COLS = ["Table", "Create Table"]
+SHOW_TRIGGERS_COLS = ["Trigger", "Event", "Table", "Statement", "Timing"]
+ENGINE_INNODB = "InnoDB"
+Cell = bytes | str | None
+Row = list[Cell]
+PeerAddr = tuple[str, int] | tuple[str, int, int, int]
 
 STATUS_COLS = [
     "Name",
@@ -88,9 +123,68 @@ STATUS_COLS = [
     "Comment",
 ]
 
+RE_SHOW_TABLES = re.compile(r"\bshow\s+tables\b")
+RE_SHOW_TABLE_STATUS = re.compile(r"\bshow\s+table\s+status\b")
+RE_SHOW_CREATE_TABLE = re.compile(r"\bshow\s+create\s+table\b")
+RE_SHOW_TRIGGERS = re.compile(r"\bshow\s+triggers\b")
+RE_SET = re.compile(r"\bset\b")
+RE_SELECT = re.compile(r"\bselect\b")
+RE_SHOW = re.compile(r"\bshow\b")
+RE_USE = re.compile(r"^\s*use\s+")
+RE_LOCK_TABLES = re.compile(r"\b(un)?lock\s+tables\b")
+RE_VERSION = re.compile(r"version")
+RE_COLLATION = re.compile(r"collation_database")
+RE_SHOW_VARIABLES = re.compile(r"\bshow\s+variables\b")
+RE_SCHEMA_SELECT = re.compile(
+    r"information_schema|performance_schema|column_masking_policy"
+)
+
+_thread_ids = 0
+_tid_lock = threading.Lock()
+
+
+@dataclass(frozen=True)
+class StubConfig:
+    bind_host: str
+    control_port: int
+    traversal_port: int
+    witness: str
+    control_table: str
+    traversal_table: str
+    server_version: str
+
+
+@dataclass
+class ClientSession:
+    sock: socket.socket
+    peer: str
+    table_name: str
+    label: str
+    deprecate_eof: bool
+
+
+def load_config() -> StubConfig:
+    return StubConfig(
+        bind_host=BIND_HOST,
+        control_port=CONTROL_PORT,
+        traversal_port=TRAVERSAL_PORT,
+        witness=WITNESS,
+        control_table=CONTROL_TABLE,
+        traversal_table=TRAVERSAL_TABLE,
+        server_version=SERVER_VERSION,
+    )
+
 
 def log(msg: str) -> None:
     print(msg, flush=True)
+
+
+def require_name_len(table: str, label: str) -> None:
+    encoded = table.encode("utf-8")
+    if len(encoded) >= NAME_LEN:
+        raise SystemExit(
+            f"table name exceeds NAME_LEN={NAME_LEN} label={label} bytes={len(encoded)}"
+        )
 
 
 def next_thread_id() -> int:
@@ -100,14 +194,22 @@ def next_thread_id() -> int:
         return _thread_ids
 
 
+def pack_u24(n: int) -> bytes:
+    return bytes((n & 0xFF, (n >> 8) & 0xFF, (n >> 16) & 0xFF))
+
+
+def unpack_u24(raw: bytes) -> int:
+    return raw[0] | (raw[1] << 8) | (raw[2] << 16)
+
+
 def lenenc_int(n: int) -> bytes:
-    if n < 251:
+    if n < LENENC_1B_LIMIT:
         return bytes([n])
     if n < 2**16:
-        return b"\xfc" + struct.pack("<H", n)
+        return bytes([LENENC_MARK_2B]) + struct.pack("<H", n)
     if n < 2**24:
-        return b"\xfd" + struct.pack("<I", n)[:3]
-    return b"\xfe" + struct.pack("<Q", n)
+        return bytes([LENENC_MARK_3B]) + struct.pack("<I", n)[:3]
+    return bytes([LENENC_MARK_8B]) + struct.pack("<Q", n)
 
 
 def lenenc_str(data: bytes | str) -> bytes:
@@ -117,20 +219,20 @@ def lenenc_str(data: bytes | str) -> bytes:
 
 
 def recvall(sock: socket.socket, n: int) -> bytes | None:
-    buf = b""
+    buf = bytearray()
     while len(buf) < n:
         chunk = sock.recv(n - len(buf))
         if not chunk:
             return None
-        buf += chunk
-    return buf
+        buf.extend(chunk)
+    return bytes(buf)
 
 
 def read_packet(sock: socket.socket) -> tuple[int, bytes] | None:
-    hdr = recvall(sock, 4)
+    hdr = recvall(sock, PACKET_HEADER_LEN)
     if not hdr:
         return None
-    length = hdr[0] | (hdr[1] << 8) | (hdr[2] << 16)
+    length = unpack_u24(hdr)
     seq = hdr[3]
     payload = recvall(sock, length) if length else b""
     if payload is None:
@@ -139,13 +241,11 @@ def read_packet(sock: socket.socket) -> tuple[int, bytes] | None:
 
 
 def send_packet(sock: socket.socket, seq: int, payload: bytes) -> int:
-    length = len(payload)
-    hdr = bytes((length & 0xFF, (length >> 8) & 0xFF, (length >> 16) & 0xFF, seq & 0xFF))
-    sock.sendall(hdr + payload)
+    sock.sendall(pack_u24(len(payload)) + bytes([seq & 0xFF]) + payload)
     return seq + 1
 
 
-def ok_payload(header: int = 0x00) -> bytes:
+def ok_payload(header: int = OK_HEADER) -> bytes:
     return (
         bytes([header, 0x00, 0x00])
         + struct.pack("<H", SERVER_STATUS_AUTOCOMMIT)
@@ -155,7 +255,7 @@ def ok_payload(header: int = 0x00) -> bytes:
 
 def err_payload(errno: int, sqlstate: str, msg: str) -> bytes:
     return (
-        b"\xff"
+        bytes([ERR_HEADER])
         + struct.pack("<H", errno)
         + b"#"
         + sqlstate.encode("ascii")
@@ -167,7 +267,7 @@ def handshake_payload(thread_id: int) -> bytes:
     caps_low = SERVER_CAPS & 0xFFFF
     caps_high = (SERVER_CAPS >> 16) & 0xFFFF
     payload = bytearray()
-    payload.append(10)
+    payload.append(PROTOCOL_VERSION)
     payload.extend(SERVER_VERSION.encode("ascii") + b"\x00")
     payload.extend(struct.pack("<I", thread_id))
     payload.extend(SCRAMBLE[:8])
@@ -176,40 +276,43 @@ def handshake_payload(thread_id: int) -> bytes:
     payload.append(CHARSET_UTF8MB4)
     payload.extend(struct.pack("<H", SERVER_STATUS_AUTOCOMMIT))
     payload.extend(struct.pack("<H", caps_high))
-    payload.append(21)
-    payload.extend(b"\x00" * 10)
+    payload.append(AUTH_PLUGIN_DATA_LEN)
+    payload.extend(b"\x00" * RESERVED_FILLER_LEN)
     payload.extend(SCRAMBLE[8:] + b"\x00")
-    payload.extend(b"mysql_native_password\x00")
+    payload.extend(AUTH_PLUGIN.encode("ascii") + b"\x00")
     return bytes(payload)
 
 
+def _skip_lenenc_auth(payload: bytes, pos: int) -> int | None:
+    if pos >= len(payload):
+        return None
+    first = payload[pos]
+    if first < LENENC_1B_LIMIT:
+        return pos + 1 + first
+    if first == LENENC_MARK_2B and pos + 3 <= len(payload):
+        alen = struct.unpack_from("<H", payload, pos + 1)[0]
+        return pos + 3 + alen
+    return None
+
+
 def parse_handshake_response(payload: bytes) -> tuple[int, str]:
-    if len(payload) < 32:
+    if len(payload) < HANDSHAKE_RESPONSE_SKIP:
         return 0, ""
     caps = struct.unpack_from("<I", payload, 0)[0]
-    pos = 4 + 4 + 1 + 23
+    pos = HANDSHAKE_RESPONSE_SKIP
     z = payload.find(b"\x00", pos)
     if z < 0:
         return caps, ""
     pos = z + 1
     if caps & CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA:
-        if pos >= len(payload):
+        nxt = _skip_lenenc_auth(payload, pos)
+        if nxt is None:
             return caps, ""
-        first = payload[pos]
-        if first < 251:
-            alen = first
-            pos += 1
-        elif first == 0xFC and pos + 3 <= len(payload):
-            alen = struct.unpack_from("<H", payload, pos + 1)[0]
-            pos += 3
-        else:
-            return caps, ""
-        pos += alen
+        pos = nxt
     elif caps & CLIENT_SECURE_CONNECTION:
         if pos >= len(payload):
             return caps, ""
-        alen = payload[pos]
-        pos += 1 + alen
+        pos += 1 + payload[pos]
     else:
         z = payload.find(b"\x00", pos)
         pos = len(payload) if z < 0 else z + 1
@@ -226,6 +329,10 @@ def parse_handshake_response(payload: bytes) -> tuple[int, str]:
     return caps, plugin
 
 
+def auth_switch_payload() -> bytes:
+    return bytes([AUTH_SWITCH_HEADER]) + AUTH_PLUGIN.encode("ascii") + b"\x00" + SCRAMBLE + b"\x00"
+
+
 def column_def(name: str) -> bytes:
     nb = name.encode("utf-8")
     payload = bytearray()
@@ -235,9 +342,9 @@ def column_def(name: str) -> bytes:
     payload.extend(lenenc_str(b""))
     payload.extend(lenenc_str(nb))
     payload.extend(lenenc_str(nb))
-    payload.append(0x0C)
+    payload.append(COLUMN_LENGTH_CODE)
     payload.extend(struct.pack("<H", CHARSET_UTF8MB4))
-    payload.extend(struct.pack("<I", 16 * 1024 * 1024))
+    payload.extend(struct.pack("<I", COLUMN_MAX_OCTETS))
     payload.append(MYSQL_TYPE_VAR_STRING)
     payload.extend(struct.pack("<H", 0))
     payload.append(0)
@@ -245,9 +352,9 @@ def column_def(name: str) -> bytes:
     return bytes(payload)
 
 
-def encode_cell(cell: bytes | str | None) -> bytes:
+def encode_cell(cell: Cell) -> bytes:
     if cell is None:
-        return b"\xfb"
+        return bytes([NULL_CELL])
     return lenenc_str(cell)
 
 
@@ -255,24 +362,37 @@ def send_result(
     sock: socket.socket,
     seq: int,
     columns: list[str],
-    rows: list[list[bytes | str | None]],
+    rows: list[Row],
     deprecate_eof: bool,
 ) -> None:
     seq = send_packet(sock, seq, lenenc_int(len(columns)))
     for col in columns:
         seq = send_packet(sock, seq, column_def(col))
     if not deprecate_eof:
-        seq = send_packet(sock, seq, ok_payload(0xFE))
+        seq = send_packet(sock, seq, ok_payload(EOF_HEADER))
     for row in rows:
-        body = b"".join(encode_cell(cell) for cell in row)
-        seq = send_packet(sock, seq, body)
-    send_packet(sock, seq, ok_payload(0xFE if deprecate_eof else 0xFE))
+        seq = send_packet(sock, seq, b"".join(encode_cell(cell) for cell in row))
+    # Always EOF-shaped 0xFE. The proven dump client accepts this terminator
+    # whether or not CLIENT_DEPRECATE_EOF is set.
+    send_packet(sock, seq, ok_payload(EOF_HEADER))
 
 
-def status_row(table_name: str) -> list[bytes | str | None]:
+def send_ok(sock: socket.socket, seq: int) -> None:
+    send_packet(sock, seq, ok_payload())
+
+
+def send_no_such_table(sock: socket.socket, seq: int) -> None:
+    send_packet(
+        sock,
+        seq,
+        err_payload(ERRNO_NO_SUCH_TABLE, SQLSTATE_NO_SUCH_TABLE, "Table 'testdb.t' doesn't exist"),
+    )
+
+
+def status_row(table_name: str) -> Row:
     return [
         table_name,
-        "InnoDB",
+        ENGINE_INNODB,
         "10",
         "Dynamic",
         "0",
@@ -285,7 +405,7 @@ def status_row(table_name: str) -> list[bytes | str | None]:
         "2026-01-01 00:00:00",
         None,
         None,
-        "utf8mb4_0900_ai_ci",
+        COLLATION_UTF8MB4,
         None,
         "",
         WITNESS,
@@ -297,111 +417,97 @@ def create_table_sql(table_name: str) -> str:
     return (
         f"CREATE TABLE {quoted} (\n"
         f"  `id` int NOT NULL\n"
-        f") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 "
+        f") ENGINE={ENGINE_INNODB} DEFAULT CHARSET=utf8mb4 "
         f"COMMENT='{WITNESS}'"
     )
 
 
-def handle_query(
-    sock: socket.socket,
-    seq: int,
-    query: str,
-    table_name: str,
-    deprecate_eof: bool,
-    peer: str,
-) -> None:
-    q = query.strip().strip(";")
-    q_l = q.lower()
-    log(f"query peer={peer} sql={query!r}")
+def _norm_sql(query: str) -> str:
+    return query.strip().strip(";").lower()
 
-    if re.search(r"\bshow\s+tables\b", q_l):
-        send_result(
-            sock,
-            seq,
-            ["Tables_in_testdb"],
-            [[table_name]],
-            deprecate_eof,
-        )
+
+def _hit(pattern: re.Pattern[str], q: str) -> bool:
+    return pattern.search(q) is not None
+
+
+def handle_query(session: ClientSession, seq: int, query: str) -> None:
+    sock = session.sock
+    table_name = session.table_name
+    deprecate_eof = session.deprecate_eof
+    q = _norm_sql(query)
+    log(f"query peer={session.peer} sql={query!r}")
+
+    if _hit(RE_SHOW_TABLES, q):
+        send_result(sock, seq, SHOW_TABLES_COLS, [[table_name]], deprecate_eof)
         return
 
-    if re.search(r"\bshow\s+table\s+status\b", q_l):
-        send_result(
-            sock,
-            seq,
-            STATUS_COLS,
-            [status_row(table_name)],
-            deprecate_eof,
-        )
+    if _hit(RE_SHOW_TABLE_STATUS, q):
+        send_result(sock, seq, STATUS_COLS, [status_row(table_name)], deprecate_eof)
         return
 
-    if re.search(r"\bshow\s+create\s+table\b", q_l):
+    # First column name must be Table; mysqldump reads field names here.
+    if _hit(RE_SHOW_CREATE_TABLE, q):
         send_result(
             sock,
             seq,
-            ["Table", "Create Table"],
+            SHOW_CREATE_COLS,
             [[table_name, create_table_sql(table_name)]],
             deprecate_eof,
         )
         return
 
-    if re.search(r"\bshow\s+triggers\b", q_l):
-        send_result(
-            sock,
-            seq,
-            ["Trigger", "Event", "Table", "Statement", "Timing"],
-            [],
-            deprecate_eof,
-        )
+    if _hit(RE_SHOW_TRIGGERS, q):
+        send_result(sock, seq, SHOW_TRIGGERS_COLS, [], deprecate_eof)
         return
 
-    if (
-        re.search(r"\bset\b", q_l)
-        and not re.search(r"\bselect\b", q_l)
-        and not re.search(r"\bshow\b", q_l)
-    ):
-        send_packet(sock, seq, ok_payload())
+    # SET SQL_QUOTE_SHOW_CREATE and character_set_results (binary, then utf8mb4).
+    if _hit(RE_SET, q) and not _hit(RE_SELECT, q) and not _hit(RE_SHOW, q):
+        send_ok(sock, seq)
         return
 
-    if re.search(r"^\s*use\s+", q_l) or re.search(r"\b(un)?lock\s+tables\b", q_l):
-        send_packet(sock, seq, ok_payload())
+    if _hit(RE_USE, q) or _hit(RE_LOCK_TABLES, q):
+        send_ok(sock, seq)
         return
 
-    if re.search(r"\bselect\b", q_l) and re.search(r"version", q_l):
+    if _hit(RE_SELECT, q) and _hit(RE_VERSION, q):
         send_result(sock, seq, ["version()"], [[SERVER_VERSION]], deprecate_eof)
         return
 
-    if re.search(r"\bselect\b", q_l) and re.search(r"collation_database", q_l):
+    if _hit(RE_SELECT, q) and _hit(RE_COLLATION, q):
         send_result(
             sock,
             seq,
             ["@@collation_database"],
-            [["utf8mb4_0900_ai_ci"]],
+            [[COLLATION_UTF8MB4]],
             deprecate_eof,
         )
         return
 
-    if re.search(r"\bshow\s+variables\b", q_l) or (
-        re.search(r"\bselect\b", q_l)
-        and re.search(r"information_schema|performance_schema|column_masking_policy", q_l)
-    ):
+    if _hit(RE_SHOW_VARIABLES, q) or (_hit(RE_SELECT, q) and _hit(RE_SCHEMA_SELECT, q)):
         send_result(sock, seq, ["Value"], [], deprecate_eof)
         return
 
-    if re.search(r"\bselect\b", q_l) or re.search(r"\bshow\b", q_l):
-        send_packet(
-            sock,
-            seq,
-            err_payload(1146, "42S02", "Table 'testdb.t' doesn't exist"),
-        )
+    # SHOW FIELDS after the client .sql write may 1146; dump still keeps the file.
+    if _hit(RE_SELECT, q) or _hit(RE_SHOW, q):
+        send_no_such_table(sock, seq)
         return
 
-    send_packet(sock, seq, ok_payload())
+    send_ok(sock, seq)
 
 
-def handle_client(conn: socket.socket, addr, table_name: str, label: str) -> None:
-    peer = f"{addr[0]}:{addr[1]}"
+def peer_name(addr: PeerAddr) -> str:
+    return f"{addr[0]}:{addr[1]}"
+
+
+def handle_client(
+    conn: socket.socket,
+    addr: PeerAddr,
+    table_name: str,
+    label: str,
+) -> None:
+    peer = peer_name(addr)
     log(f"accept label={label} peer={peer}")
-    conn.settimeout(30)
+    conn.settimeout(CLIENT_TIMEOUT_S)
     try:
         tid = next_thread_id()
         send_packet(conn, 0, handshake_payload(tid))
@@ -412,16 +518,20 @@ def handle_client(conn: socket.socket, addr, table_name: str, label: str) -> Non
         caps, plugin = parse_handshake_response(payload)
         log(f"handshake label={label} peer={peer} caps=0x{caps:08x} plugin={plugin!r}")
         seq = 2
-        if plugin and plugin not in ("mysql_native_password", ""):
-            switch = b"\xfe" + b"mysql_native_password\x00" + SCRAMBLE + b"\x00"
-            seq = send_packet(conn, seq, switch)
+        if plugin and plugin not in (AUTH_PLUGIN, ""):
+            seq = send_packet(conn, seq, auth_switch_payload())
             nxt = read_packet(conn)
             if nxt is None:
                 return
             seq = nxt[0] + 1
-        send_packet(conn, seq, ok_payload())
-        deprecate_eof = bool(caps & CLIENT_DEPRECATE_EOF)
-
+        send_ok(conn, seq)
+        session = ClientSession(
+            sock=conn,
+            peer=peer,
+            table_name=table_name,
+            label=label,
+            deprecate_eof=bool(caps & CLIENT_DEPRECATE_EOF),
+        )
         while True:
             pkt = read_packet(conn)
             if pkt is None:
@@ -435,22 +545,21 @@ def handle_client(conn: socket.socket, addr, table_name: str, label: str) -> Non
                 log(f"quit label={label} peer={peer}")
                 return
             if cmd in (COM_PING, COM_RESET_CONNECTION, COM_STATISTICS):
-                send_packet(conn, 1, ok_payload())
+                send_ok(conn, COMMAND_SEQ)
                 continue
             if cmd == COM_INIT_DB:
                 db = body.split(b"\x00", 1)[0].decode("utf-8", "replace")
                 log(f"init_db label={label} peer={peer} db={db!r}")
-                send_packet(conn, 1, ok_payload())
+                send_ok(conn, COMMAND_SEQ)
                 continue
             if cmd == COM_FIELD_LIST:
-                send_result(conn, 1, ["Field"], [], deprecate_eof)
+                send_result(conn, COMMAND_SEQ, ["Field"], [], session.deprecate_eof)
                 continue
             if cmd == COM_QUERY:
-                sql = body.decode("utf-8", "replace")
-                handle_query(conn, 1, sql, table_name, deprecate_eof, peer)
+                handle_query(session, COMMAND_SEQ, body.decode("utf-8", "replace"))
                 continue
             log(f"unknown-cmd label={label} peer={peer} cmd=0x{cmd:02x} len={len(body)}")
-            send_packet(conn, 1, ok_payload())
+            send_ok(conn, COMMAND_SEQ)
     except (TimeoutError, socket.timeout, ConnectionResetError, BrokenPipeError, OSError) as exc:
         log(f"disconnect label={label} peer={peer} err={exc}")
     except Exception:
@@ -462,12 +571,12 @@ def handle_client(conn: socket.socket, addr, table_name: str, label: str) -> Non
             pass
 
 
-def serve(port: int, table_name: str, label: str) -> None:
+def serve(cfg: StubConfig, port: int, table_name: str, label: str) -> None:
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind((BIND_HOST, port))
-    sock.listen(16)
-    log(f"listen label={label} bind={BIND_HOST}:{port} table={table_name!r}")
+    sock.bind((cfg.bind_host, port))
+    sock.listen(LISTEN_BACKLOG)
+    log(f"listen label={label} bind={cfg.bind_host}:{port} table={table_name!r}")
     while True:
         conn, addr = sock.accept()
         threading.Thread(
@@ -478,14 +587,21 @@ def serve(port: int, table_name: str, label: str) -> None:
 
 
 def main() -> None:
+    cfg = load_config()
+    require_name_len(cfg.control_table, "control")
+    require_name_len(cfg.traversal_table, "traversal")
     log(
-        f"stub start control={BIND_HOST}:{CONTROL_PORT} traversal={BIND_HOST}:{TRAVERSAL_PORT} "
-        f"control_table={CONTROL_TABLE!r} traversal_table={TRAVERSAL_TABLE!r} witness={WITNESS}"
+        f"stub start control={cfg.bind_host}:{cfg.control_port} "
+        f"traversal={cfg.bind_host}:{cfg.traversal_port} "
+        f"control_table={cfg.control_table!r} traversal_table={cfg.traversal_table!r} "
+        f"witness={cfg.witness}"
     )
     threading.Thread(
-        target=serve, args=(CONTROL_PORT, CONTROL_TABLE, "control"), daemon=True
+        target=serve,
+        args=(cfg, cfg.control_port, cfg.control_table, "control"),
+        daemon=True,
     ).start()
-    serve(TRAVERSAL_PORT, TRAVERSAL_TABLE, "traversal")
+    serve(cfg, cfg.traversal_port, cfg.traversal_table, "traversal")
 
 
 if __name__ == "__main__":

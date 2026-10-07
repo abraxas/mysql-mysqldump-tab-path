@@ -224,32 +224,69 @@ def _cprint(*args, **kwargs):
 print_abraxas_banner()
 _builtins.print = _cprint
 
-"""Prove mysqldump 26.7.0 --tab writes client .sql outside DIR."""
-
+# Prove mysqldump 26.7.0 --tab writes client .sql outside DIR.
 
 import os
 import re
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
-WITNESS = "MYSQL-DUMP-TAB-TRAVERSAL-WITNESS"
 LABEL = "mysql-mysqldump-tab-path"
+WITNESS = "MYSQL-DUMP-TAB-TRAVERSAL-WITNESS"
+IMAGE_TAG = "mysql:26.7.0"
+DUMP_VERSION = "26.7.0"
 COMPOSE_PROJECT = os.environ.get("COMPOSE_PROJECT_NAME", LABEL)
+DUMP_SERVICE = "dump"
+STUB_SERVICE = "stub"
+CONTROL_PORT = 3306
+TRAVERSAL_PORT = 3307
+DUMP_TIMEOUT_S = 40
+SETTLE_S = 0.4
+MTIME_SLACK_S = 5
+TAB_DIR = "/work/tabdir"
+CONTROL_TABLE = "t"
+CONTAINER_TABDIR = "/work/tabdir"
+CONTAINER_ORACLE = "/work/oracle"
+DUMP_USER = "root"
+DUMP_DB = "testdb"
 HERE = Path(__file__).resolve().parent
 WORK = HERE / "work"
 TABDIR = WORK / "tabdir"
 ORACLE = WORK / "oracle"
-CONTROL_SQL = TABDIR / "t.sql"
+CONTROL_SQL = TABDIR / f"{CONTROL_TABLE}.sql"
 TRAVERSAL_SQL = ORACLE / f"{WITNESS}.sql"
-IMAGE_TAG = "mysql:26.7.0"
-DUMP_TIMEOUT = 40
-TAB_DIR = "/work/tabdir"
+DUMP_MARKERS = ("MySQL dump", "CREATE TABLE", "Server version")
+
+
+@dataclass(frozen=True)
+class DumpRun:
+    rc: int | None
+    stdout: str
+    stderr: str
 
 
 def log(msg: str) -> None:
     print(msg, flush=True)
+
+
+def fail(reason: str) -> None:
+    log(f"FAIL {LABEL} {reason} {WITNESS}")
+    raise SystemExit(1)
+
+
+def yes_no(ok: bool) -> str:
+    return "yes" if ok else "no"
+
+
+def decode_pipe(blob: bytes | str | None) -> str:
+    if blob is None:
+        return ""
+    if isinstance(blob, bytes):
+        return blob.decode("utf-8", "replace")
+    return blob
 
 
 def compose(*args: str, timeout: int = 60) -> subprocess.CompletedProcess[str]:
@@ -263,13 +300,12 @@ def compose(*args: str, timeout: int = 60) -> subprocess.CompletedProcess[str]:
 
 
 def dump_version() -> str:
-    proc = compose("exec", "-T", "dump", "mysqldump", "--version", timeout=30)
+    proc = compose("exec", "-T", DUMP_SERVICE, "mysqldump", "--version", timeout=30)
     text = ((proc.stdout or "") + (proc.stderr or "")).strip()
     log(f"mysqldump-version rc={proc.returncode} text={text!r}")
-    if proc.returncode != 0 or "26.7.0" not in text:
-        log(f"FAIL {LABEL} dump-version-mismatch image={IMAGE_TAG} {text!r} {WITNESS}")
-        raise SystemExit(1)
-    return text.splitlines()[-1] if text else "mysqldump 26.7.0"
+    if proc.returncode != 0 or DUMP_VERSION not in text:
+        fail(f"dump-version-mismatch image={IMAGE_TAG} {text!r}")
+    return text.splitlines()[-1] if text else f"mysqldump {DUMP_VERSION}"
 
 
 def ensure_dirs() -> None:
@@ -304,35 +340,36 @@ def read_text(path: Path) -> str:
 
 
 def looks_like_dump(text: str) -> bool:
-    return bool(
-        ("MySQL dump" in text or "CREATE TABLE" in text or "Server version" in text)
-        and WITNESS in text
-    )
+    return any(marker in text for marker in DUMP_MARKERS) and WITNESS in text
 
 
-def run_dump(port: int, label: str) -> tuple[int | None, str, str]:
-    cmd = [
+def mysqldump_cmd(port: int) -> list[str]:
+    return [
         "docker",
         "compose",
         "-p",
         COMPOSE_PROJECT,
         "exec",
         "-T",
-        "dump",
+        DUMP_SERVICE,
         "mysqldump",
         "--protocol=TCP",
         "--ssl-mode=DISABLED",
         "-h",
-        "stub",
+        STUB_SERVICE,
         "-P",
         str(port),
         "-u",
-        "root",
+        DUMP_USER,
         "--password=",
         f"--tab={TAB_DIR}",
         "--verbose",
-        "testdb",
+        DUMP_DB,
     ]
+
+
+def run_dump(port: int, label: str) -> DumpRun:
+    cmd = mysqldump_cmd(port)
     log(f"run-{label} port={port} cmd={' '.join(cmd)}")
     try:
         proc = subprocess.run(
@@ -340,30 +377,46 @@ def run_dump(port: int, label: str) -> tuple[int | None, str, str]:
             cwd=HERE,
             text=True,
             capture_output=True,
-            timeout=DUMP_TIMEOUT,
+            timeout=DUMP_TIMEOUT_S,
         )
-        return proc.returncode, proc.stdout or "", proc.stderr or ""
+        return DumpRun(proc.returncode, proc.stdout or "", proc.stderr or "")
     except subprocess.TimeoutExpired as exc:
-        out = exc.stdout.decode("utf-8", "replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
-        err = exc.stderr.decode("utf-8", "replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
-        return None, out, err + "\nTIMEOUT"
+        return DumpRun(None, decode_pipe(exc.stdout), decode_pipe(exc.stderr) + "\nTIMEOUT")
 
 
 def stub_queries() -> str:
-    proc = compose("logs", "--no-color", "stub", timeout=30)
+    proc = compose("logs", "--no-color", STUB_SERVICE, timeout=30)
     text = (proc.stdout or "") + (proc.stderr or "")
-    queries = []
-    for line in text.splitlines():
-        if line.startswith("query ") or " sql=" in line or line.startswith("init_db "):
-            queries.append(line)
+    queries = [
+        line
+        for line in text.splitlines()
+        if line.startswith("query ") or " sql=" in line or line.startswith("init_db ")
+    ]
     return "\n".join(queries[-120:])
 
 
 def container_ls(path: str) -> str:
-    proc = compose("exec", "-T", "dump", "ls", "-la", path, timeout=20)
+    proc = compose("exec", "-T", DUMP_SERVICE, "ls", "-la", path, timeout=20)
     blob = ((proc.stdout or "") + (proc.stderr or "")).strip()
     log(f"ioc container-ls path={path} rc={proc.returncode} text={blob!r}")
     return blob
+
+
+def log_dump(label: str, run: DumpRun) -> None:
+    log(f"ioc {label}-rc={run.rc!s}")
+    log(f"ioc {label}-stderr={run.stderr[-1800:]!r}")
+    log(f"ioc {label}-stdout-head={run.stdout[:400]!r}")
+    log(f"ioc {label}-files={list_rel(WORK)}")
+    container_ls(CONTAINER_TABDIR)
+    container_ls(CONTAINER_ORACLE)
+
+
+def tabdir_witness_hits() -> list[str]:
+    return [
+        str(path.relative_to(WORK))
+        for path in TABDIR.rglob("*")
+        if path.is_file() and WITNESS in path.name
+    ]
 
 
 def main() -> int:
@@ -375,33 +428,23 @@ def main() -> int:
     wipe_sql(ORACLE)
     log(f"ioc pre-control files={list_rel(WORK)}")
 
-    c_rc, c_out, c_err = run_dump(3306, "control")
-    time.sleep(0.4)
-    log(f"ioc control-rc={c_rc!s}")
-    log(f"ioc control-stderr={c_err[-1800:]!r}")
-    log(f"ioc control-stdout-head={c_out[:400]!r}")
-    log(f"ioc control-files={list_rel(WORK)}")
-    container_ls("/work/tabdir")
-    container_ls("/work/oracle")
+    control = run_dump(CONTROL_PORT, "control")
+    time.sleep(SETTLE_S)
+    log_dump("control", control)
 
     control_sql_yes = CONTROL_SQL.is_file()
     control_oracle_absent = not TRAVERSAL_SQL.exists()
     control_sql_text = read_text(CONTROL_SQL) if control_sql_yes else ""
-    log(f"ioc control-sql-exists={control_sql_yes} path=work/tabdir/t.sql")
+    log(f"ioc control-sql-exists={control_sql_yes} path=work/tabdir/{CONTROL_TABLE}.sql")
     log(f"ioc control-oracle-absent={control_oracle_absent}")
     if control_sql_yes:
         log(f"ioc control-sql-head={control_sql_text[:300]!r}")
 
     wipe_sql(ORACLE)
     started = time.time()
-    t_rc, t_out, t_err = run_dump(3307, "traversal")
-    time.sleep(0.4)
-    log(f"ioc traversal-rc={t_rc!s}")
-    log(f"ioc traversal-stderr={t_err[-1800:]!r}")
-    log(f"ioc traversal-stdout-head={t_out[:400]!r}")
-    log(f"ioc traversal-files={list_rel(WORK)}")
-    container_ls("/work/tabdir")
-    container_ls("/work/oracle")
+    traversal = run_dump(TRAVERSAL_PORT, "traversal")
+    time.sleep(SETTLE_S)
+    log_dump("traversal", traversal)
 
     queries = stub_queries()
     log("ioc stub-queries-tail <<<")
@@ -411,18 +454,17 @@ def main() -> int:
     saw_show_tables = bool(re.search(r"show\s+tables", queries, re.I))
     saw_show_status = bool(re.search(r"show\s+table\s+status", queries, re.I))
     saw_show_create = bool(re.search(r"show\s+create\s+table", queries, re.I))
-    log(f"ioc saw-show-tables={saw_show_tables} saw-show-status={saw_show_status} saw-show-create={saw_show_create}")
+    log(
+        f"ioc saw-show-tables={saw_show_tables} "
+        f"saw-show-status={saw_show_status} saw-show-create={saw_show_create}"
+    )
 
     traversal_exists = TRAVERSAL_SQL.is_file()
     traversal_text = read_text(TRAVERSAL_SQL) if traversal_exists else ""
     mtime_ok = False
     if traversal_exists:
-        mtime_ok = TRAVERSAL_SQL.stat().st_mtime >= (started - 5)
-    tabdir_hits = [
-        str(p.relative_to(WORK))
-        for p in TABDIR.rglob("*")
-        if p.is_file() and WITNESS in p.name
-    ]
+        mtime_ok = TRAVERSAL_SQL.stat().st_mtime >= (started - MTIME_SLACK_S)
+    tabdir_hits = tabdir_witness_hits()
     merely_tabdir = (not traversal_exists) and bool(tabdir_hits)
     dump_like = looks_like_dump(traversal_text) if traversal_exists else False
     log(f"ioc traversal-sql-exists={traversal_exists} path=work/oracle/{WITNESS}.sql")
@@ -433,17 +475,16 @@ def main() -> int:
 
     control_ok = control_sql_yes and control_oracle_absent
     traversal_ok = traversal_exists and mtime_ok and dump_like and not merely_tabdir
-    ok = control_ok and traversal_ok and "26.7.0" in version
+    ok = control_ok and traversal_ok and DUMP_VERSION in version
     status = "SUCCESS" if ok else "FAIL"
-    control_flag = "yes" if control_ok else "no"
-    traversal_flag = "yes" if traversal_ok else "no"
     log(
-        f"{status} {LABEL} control-sql={control_flag} traversal-outside={traversal_flag} "
-        f"dump=26.7.0 image={IMAGE_TAG} {WITNESS}"
+        f"{status} {LABEL} control-sql={yes_no(control_ok)} "
+        f"traversal-outside={yes_no(traversal_ok)} "
+        f"dump={DUMP_VERSION} image={IMAGE_TAG} {WITNESS}"
     )
     return 0 if ok else 1
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())
 
